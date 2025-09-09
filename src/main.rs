@@ -1,36 +1,55 @@
-use std::io::Write;
+use std::rc::Rc;
+
+struct PendingTask {
+    call_id: usize,
+}
 
 struct Pipeline {
-    task: RLTask,
+    ctx: ReqRespCtx,
+    todos: Vec<RLTask>,
+    pendings: Vec<PendingTask>,
 }
 
 impl Pipeline {
-    fn eval(&self, ctx: &mut ReqRespCtx) {
-        self.task.exec(ctx);
+    fn eval(&mut self) {
+        for todo in self.todos.drain(..) {
+            if let Some(t) = todo.exec(&mut self.ctx) {
+                self.pendings.push(t);
+            }
+        }
     }
 }
 
 struct RLTask {
     predicate: Predicate,
-    service: String,
+    service: Rc<Service>,
     ok_outcome: Action,
 }
 
 impl RLTask {
-    fn exec(&self, ctx: &mut ReqRespCtx) {
+    fn exec(self, ctx: &mut ReqRespCtx) -> Option<PendingTask> {
         if self.predicate.eval() {
-            call_grpc!("Call out to {}", self.service);
-            // if ok then
-            self.ok_outcome.apply(ctx);
-            // otherwise
-            // ko_outcome
+            let call_id: usize = self.service.dispatch(ctx);
+            return Some(PendingTask { call_id });
         }
+        None
     }
 }
 
-struct Action {
-
+enum Task {
+    Todo(RLTask),
+    Pending(()),
 }
+
+struct Service {}
+
+impl Service {
+    pub(crate) fn dispatch(&self, ctx: &mut ReqRespCtx) -> usize {
+        0
+    }
+}
+
+struct Action {}
 
 impl Action {
     fn apply(&self, ctx: &mut ReqRespCtx) {
@@ -38,44 +57,43 @@ impl Action {
     }
 }
 
-struct Predicate {
-
-}
+struct Predicate {}
 
 impl Predicate {
-    fn eval(&self) -> bool{
+    fn eval(&self) -> bool {
         true
     }
 }
 
-struct ReqRespCtx {
-
-}
+struct ReqRespCtx {}
 
 impl ReqRespCtx {
-    fn add_response_header(&mut self, key: &str, value: &str) {
-
-    }
+    fn add_response_header(&mut self, key: &str, value: &str) {}
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
     use crate::{Action, Pipeline, Predicate, RLTask, ReqRespCtx};
+    use Service;
 
     #[test]
     fn it_works() {
-        let pipeline = Pipeline {
-            task: RLTask {
+        // on_request_headers() {
+        let ctx = ReqRespCtx {};
+        let mut pipeline = Pipeline {
+            ctx,
+            todos: vec![RLTask {
                 predicate: Predicate {},
-                service: "limitador".to_string(),
+                service: Service {}.into(),
                 ok_outcome: Action {},
-            }
+            }],
+            pendings: vec![],
         };
 
-        // on_request_headers() {
-        let ctx = &mut ReqRespCtx {};
         pipeline.eval();
+
+        // on_grpc_response() {
+        //pipeline.digest(response);
 
         // on_request_body() {
 
@@ -83,11 +101,6 @@ mod tests {
 
         // on_response_body() {
         pipeline.eval();
-
-
-        // on_grpc_response() {
-        pipeline.digest(response);
-
     }
 }
 
