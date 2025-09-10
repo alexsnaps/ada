@@ -1,4 +1,4 @@
-use crate::PendingValue::Revolved;
+use crate::PendingValue::Resolved;
 use crate::Phase::ResponseHeaders;
 use std::cell::RefCell;
 use std::{collections::BTreeMap, rc::Rc};
@@ -21,30 +21,34 @@ impl Service {
 
 struct Pipeline {
     ctx: ReqRespCtx,
-    todos: Vec<RLTask>,
+    todos: Vec<Box<dyn Action>>,
     pending_tasks: BTreeMap<usize, PendingTask>,
     pending_actions: Vec<Box<dyn Action>>,
 }
 
 impl Pipeline {
     fn eval(mut self) -> Option<Self> {
-        self.pending_actions
-            .retain(|action| !action.apply(&mut self.ctx));
+        let mut actions = Vec::default();
+        for action in self.pending_actions.drain(..) {
+            match action.apply(&mut self.ctx) {
+                ActionOutcome::Done => (),
+                ActionOutcome::Deferred(_) => panic!("blah"),
+                ActionOutcome::Pending(action) => actions.push(action),
+            };
+        }
+        self.pending_actions = actions;
 
         let mut todos = Vec::default();
         for task in self.todos.drain(..) {
-            let either = task.exec(&mut self.ctx);
-            match either {
-                Either::Left(None) => {}
-                Either::Left(Some((token_id, t))) => {
+            match task.apply(&mut self.ctx) {
+                ActionOutcome::Done => {}
+                ActionOutcome::Deferred((token_id, t)) => {
                     if self.pending_tasks.contains_key(&token_id) {
                         panic!("NONONONONO")
                     }
                     self.pending_tasks.insert(token_id, t);
                 }
-                Either::Right(todo) => {
-                    todos.push(todo);
-                }
+                ActionOutcome::Pending(action) => todos.push(action),
             }
         }
         self.todos = todos;
@@ -59,10 +63,12 @@ impl Pipeline {
     fn digest(&mut self, token_id: usize, response: Vec<u8>) {
         if let Some(pending) = self.pending_tasks.remove(&token_id) {
             // Process the response
-            if let Some(action) = pending.process_response(response)
-                && !action.apply(&mut self.ctx)
-            {
-                self.pending_actions.push(action);
+            if let Some(action) = pending.process_response(response) {
+                match action.apply(&mut self.ctx) {
+                    ActionOutcome::Done => {}
+                    ActionOutcome::Deferred(_) => panic!("Action should not be deferred in digest"),
+                    ActionOutcome::Pending(action) => self.pending_actions.push(action),
+                }
             };
         } else {
             panic!("token_id={} not found", token_id);
@@ -93,13 +99,13 @@ struct RLTask {
     rl_action: Box<dyn Action>,
 }
 
-impl RLTask {
-    fn exec(self, ctx: &mut ReqRespCtx) -> Either<Option<(usize, PendingTask)>, Self> {
+impl Action for RLTask {
+    fn apply(self: Box<Self>, ctx: &mut ReqRespCtx) -> ActionOutcome {
         match self.predicate.eval(ctx) {
-            Revolved(exec) => {
+            Resolved(exec) => {
                 if exec {
                     let token_id: usize = self.service.dispatch(ctx);
-                    Either::Left(Some((
+                    ActionOutcome::Deferred((
                         token_id,
                         PendingTask {
                             is_blocking: true,
@@ -107,12 +113,17 @@ impl RLTask {
                             rl_action: self.rl_action,
                             service: self.service,
                         },
-                    )))
+                    ))
                 } else {
-                    Either::Left(None)
+                    ActionOutcome::Done
                 }
             }
-            PendingValue::Pending => Either::Right(self),
+            PendingValue::Pending => ActionOutcome::Pending(Box::new(RLTask {
+                predicate: self.predicate,
+                ok_action: self.ok_action,
+                rl_action: self.rl_action,
+                service: self.service,
+            })),
         }
     }
 }
@@ -141,21 +152,30 @@ impl PendingTask {
     }
 }
 
-trait Action {
-    fn apply(&self, ctx: &mut ReqRespCtx) -> bool;
+enum ActionOutcome {
+    Done,
+    Deferred((usize, PendingTask)),
+    Pending(Box<dyn Action>),
 }
 
+trait Action {
+    fn apply(self: Box<Self>, ctx: &mut ReqRespCtx) -> ActionOutcome;
+}
+
+#[derive(Clone)]
 struct AddResponseHeadersAction {
     headers: Vec<(String, String)>,
 }
 
 impl Action for AddResponseHeadersAction {
-    fn apply(&self, ctx: &mut ReqRespCtx) -> bool {
+    fn apply(self: Box<Self>, ctx: &mut ReqRespCtx) -> ActionOutcome {
         if *ctx.test_current_phase.borrow() == Some(ResponseHeaders) {
             ctx.response_headers = self.headers.clone();
-            true
+            ActionOutcome::Done
         } else {
-            false
+            ActionOutcome::Pending(Box::new(AddResponseHeadersAction {
+                headers: self.headers,
+            }))
         }
     }
 }
@@ -163,14 +183,14 @@ impl Action for AddResponseHeadersAction {
 struct TooManyRequestsAction {}
 
 impl Action for TooManyRequestsAction {
-    fn apply(&self, ctx: &mut ReqRespCtx) -> bool {
+    fn apply(self: Box<Self>, ctx: &mut ReqRespCtx) -> ActionOutcome {
         ctx.status_code = Some(429);
-        true
+        ActionOutcome::Done
     }
 }
 
 enum PendingValue<T> {
-    Revolved(T),
+    Resolved(T),
     Pending,
 }
 
@@ -217,15 +237,15 @@ mod tests {
     fn it_rate_limits() {
         // on_request_headers() {
         let mut ctx = ReqRespCtx::default();
-        ctx.test_predicate_values.push(PendingValue::Revolved(true));
+        ctx.test_predicate_values.push(PendingValue::Resolved(true));
         let mut pipeline = Pipeline {
             ctx,
-            todos: vec![RLTask {
+            todos: vec![Box::new(RLTask {
                 predicate: Predicate {},
                 service: Service {}.into(),
                 ok_action: None,
                 rl_action: Box::new(TooManyRequestsAction {}),
-            }],
+            })],
             pending_tasks: Default::default(),
             pending_actions: Default::default(),
         };
@@ -256,17 +276,17 @@ mod tests {
         let mut ctx = ReqRespCtx::default();
         let mut rc = Rc::new(RefCell::new(Some(Phase::RequestHeaders)));
         ctx.test_current_phase = rc.clone();
-        ctx.test_predicate_values.push(PendingValue::Revolved(true));
+        ctx.test_predicate_values.push(PendingValue::Resolved(true));
         let mut pipeline = Pipeline {
             ctx: ctx,
-            todos: vec![RLTask {
+            todos: vec![Box::new(RLTask {
                 predicate: Predicate {},
                 service: Service {}.into(),
                 ok_action: Some(AddResponseHeadersAction {
                     headers: vec![("X-RateLimit-Limit".to_string(), "10".to_string())],
                 }),
                 rl_action: Box::new(TooManyRequestsAction {}),
-            }],
+            })],
             pending_tasks: Default::default(),
             pending_actions: Default::default(),
         };
@@ -313,27 +333,27 @@ mod tests {
         let mut rc = Rc::new(RefCell::new(Some(Phase::RequestHeaders)));
         ctx.test_current_phase = rc.clone();
         ctx.test_predicate_values
-            .insert(0, PendingValue::Revolved(true));
+            .insert(0, PendingValue::Resolved(true));
         ctx.test_predicate_values.insert(0, PendingValue::Pending);
         ctx.test_predicate_values.insert(0, PendingValue::Pending);
         ctx.test_predicate_values.insert(0, PendingValue::Pending);
         ctx.test_predicate_values
-            .insert(0, PendingValue::Revolved(true));
+            .insert(0, PendingValue::Resolved(true));
         let mut pipeline = Pipeline {
             ctx: ctx,
             todos: vec![
-                RLTask {
+                Box::new(RLTask {
                     predicate: Predicate {},
                     service: Service {}.into(),
                     ok_action: None,
                     rl_action: Box::new(TooManyRequestsAction {}),
-                },
-                RLTask {
+                }),
+                Box::new(RLTask {
                     predicate: Predicate {},
                     service: Service {}.into(),
                     ok_action: None,
                     rl_action: Box::new(TooManyRequestsAction {}),
-                },
+                }),
             ],
             pending_tasks: Default::default(),
             pending_actions: Default::default(),
