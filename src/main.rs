@@ -84,7 +84,7 @@ struct RLTask {
     predicate: Predicate,
     service: Rc<Service>,
     ok_action: Option<AddResponseHeadersAction>,
-    rl_action: TooManyRequestsAction,
+    rl_action: Box<dyn Action>,
 }
 
 impl RLTask {
@@ -114,14 +114,14 @@ impl RLTask {
 struct PendingTask {
     is_blocking: bool,
     ok_action: Option<AddResponseHeadersAction>,
-    rl_action: TooManyRequestsAction,
+    rl_action: Box<dyn Action>,
     service: Rc<Service>,
 }
 
 impl PendingTask {
     fn process_response(self, response: Vec<u8>) -> Option<Box<dyn Action>> {
         if self.service.parse_message(response) {
-            Some(Box::new(self.rl_action))
+            Some(self.rl_action)
         } else if let Some(action) = self.ok_action {
             Some(Box::new(action))
         } else {
@@ -208,7 +208,7 @@ mod tests {
                 predicate: Predicate {},
                 service: Service {}.into(),
                 ok_action: None,
-                rl_action: TooManyRequestsAction {},
+                rl_action: Box::new(TooManyRequestsAction {}),
             }],
             pending_tasks: Default::default(),
             pending_actions: Default::default(),
@@ -248,7 +248,7 @@ mod tests {
                 ok_action: Some(AddResponseHeadersAction {
                     headers: vec![("X-RateLimit-Limit".to_string(), "10".to_string())],
                 }),
-                rl_action: TooManyRequestsAction {},
+                rl_action: Box::new(TooManyRequestsAction {}),
             }],
             pending_tasks: Default::default(),
             pending_actions: Default::default(),
