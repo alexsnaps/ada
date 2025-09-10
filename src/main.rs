@@ -23,21 +23,10 @@ struct Pipeline {
     ctx: ReqRespCtx,
     todos: Vec<Box<dyn Action>>,
     pending_tasks: BTreeMap<usize, PendingTask>,
-    pending_actions: Vec<Box<dyn Action>>,
 }
 
 impl Pipeline {
     fn eval(mut self) -> Option<Self> {
-        let mut actions = Vec::default();
-        for action in self.pending_actions.drain(..) {
-            match action.apply(&mut self.ctx) {
-                ActionOutcome::Done => (),
-                ActionOutcome::Deferred(_) => panic!("blah"),
-                ActionOutcome::Pending(action) => actions.push(action),
-            };
-        }
-        self.pending_actions = actions;
-
         let mut todos = Vec::default();
         for task in self.todos.drain(..) {
             match task.apply(&mut self.ctx) {
@@ -52,8 +41,7 @@ impl Pipeline {
             }
         }
         self.todos = todos;
-        if self.pending_tasks.is_empty() && self.pending_actions.is_empty() && self.todos.is_empty()
-        {
+        if self.pending_tasks.is_empty() && self.todos.is_empty() {
             None
         } else {
             Some(self)
@@ -67,7 +55,7 @@ impl Pipeline {
                 match action.apply(&mut self.ctx) {
                     ActionOutcome::Done => {}
                     ActionOutcome::Deferred(_) => panic!("Action should not be deferred in digest"),
-                    ActionOutcome::Pending(action) => self.pending_actions.push(action),
+                    ActionOutcome::Pending(action) => self.todos.push(action),
                 }
             };
         } else {
@@ -83,10 +71,7 @@ impl Pipeline {
 #[cfg(test)]
 impl Drop for Pipeline {
     fn drop(&mut self) {
-        if !self.todos.is_empty()
-            || !self.pending_tasks.is_empty()
-            || !self.pending_actions.is_empty()
-        {
+        if !self.todos.is_empty() || !self.pending_tasks.is_empty() {
             panic!("Pipeline dropped with pending tasks");
         }
     }
@@ -247,7 +232,6 @@ mod tests {
                 rl_action: Box::new(TooManyRequestsAction {}),
             })],
             pending_tasks: Default::default(),
-            pending_actions: Default::default(),
         };
 
         pipeline = pipeline
@@ -288,7 +272,6 @@ mod tests {
                 rl_action: Box::new(TooManyRequestsAction {}),
             })],
             pending_tasks: Default::default(),
-            pending_actions: Default::default(),
         };
 
         pipeline = pipeline
@@ -356,7 +339,6 @@ mod tests {
                 }),
             ],
             pending_tasks: Default::default(),
-            pending_actions: Default::default(),
         };
 
         pipeline = pipeline
