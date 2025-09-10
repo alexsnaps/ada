@@ -1,12 +1,23 @@
-use crate::PendingValue::Resolved;
-use crate::Phase::ResponseHeaders;
+
+use std::any::{Any, TypeId};
 use std::cell::RefCell;
 use std::{collections::BTreeMap, rc::Rc};
 
-struct Service {}
+mod envoy;
+mod services;
 
-impl Service {
-    pub(crate) fn dispatch(&self, ctx: &mut ReqRespCtx) -> usize {
+trait Service {
+    type Response;
+    fn dispatch(&self, ctx: &mut ReqRespCtx) -> usize;
+    fn parse_message(&self, message: Vec<u8>) -> Self::Response;
+}
+
+struct FakeService {}
+
+impl Service for FakeService {
+    type Response = bool;
+
+    fn dispatch(&self, ctx: &mut ReqRespCtx) -> usize {
         ctx.next_token_id()
     }
     fn parse_message(&self, mut message: Vec<u8>) -> bool {
@@ -77,7 +88,7 @@ impl Drop for Pipeline {
 
 struct RLTask {
     predicate: Predicate,
-    service: Rc<Service>,
+    service: Rc<dyn Service<Response = bool>>,
     allow_task: Option<Box<dyn Task>>,
     deny_task: Box<dyn Task>,
 }
@@ -85,7 +96,7 @@ struct RLTask {
 impl Task for RLTask {
     fn apply(self: Box<Self>, ctx: &mut ReqRespCtx) -> TaskOutcome {
         match self.predicate.eval(ctx) {
-            Resolved(exec) => {
+            PendingValue::Resolved(exec) => {
                 if exec {
                     let token_id: usize = self.service.dispatch(ctx);
                     TaskOutcome::Deferred((
@@ -110,7 +121,7 @@ struct PendingTask {
     is_blocking: bool,
     allow_task: Option<Box<dyn Task>>,
     deny_task: Box<dyn Task>,
-    service: Rc<Service>,
+    service: Rc<dyn Service<Response = bool>>,
 }
 
 impl PendingTask {
@@ -147,7 +158,7 @@ struct AddResponseHeadersTask {
 
 impl Task for AddResponseHeadersTask {
     fn apply(self: Box<Self>, ctx: &mut ReqRespCtx) -> TaskOutcome {
-        if *ctx.test_current_phase.borrow() == Some(ResponseHeaders) {
+        if *ctx.test_current_phase.borrow() == Some(Phase::ResponseHeaders) {
             ctx.response_headers = self.headers.clone();
             TaskOutcome::Done
         } else {
@@ -165,6 +176,8 @@ impl Task for TooManyRequestsTask {
     }
 }
 
+#[derive(Debug)]
+#[derive(PartialEq)]
 enum PendingValue<T> {
     Resolved(T),
     Pending,
@@ -204,6 +217,14 @@ impl ReqRespCtx {
         self.test_token_id += 1;
         self.test_token_id
     }
+
+    fn get_attribute(&self, key: &str) -> PendingValue<Option<String>> {
+        match key {
+            "ratelimit.domain" => PendingValue::Resolved(Some("example".to_string())),
+            _ => PendingValue::Resolved(None),
+        }
+    }
+
 }
 
 mod tests {
@@ -218,7 +239,7 @@ mod tests {
             ctx,
             todos: vec![Box::new(RLTask {
                 predicate: Predicate {},
-                service: Service {}.into(),
+                service: Rc::new(FakeService {}),
                 allow_task: None,
                 deny_task: Box::new(TooManyRequestsTask {}),
             })],
@@ -256,7 +277,7 @@ mod tests {
             ctx: ctx,
             todos: vec![Box::new(RLTask {
                 predicate: Predicate {},
-                service: Service {}.into(),
+                service: Rc::new(FakeService {}),
                 allow_task: Some(Box::new(AddResponseHeadersTask {
                     headers: vec![("X-RateLimit-Limit".to_string(), "10".to_string())],
                 })),
@@ -318,13 +339,13 @@ mod tests {
             todos: vec![
                 Box::new(RLTask {
                     predicate: Predicate {},
-                    service: Service {}.into(),
+                    service: Rc::new(FakeService {}),
                     allow_task: None,
                     deny_task: Box::new(TooManyRequestsTask {}),
                 }),
                 Box::new(RLTask {
                     predicate: Predicate {},
-                    service: Service {}.into(),
+                    service: Rc::new(FakeService {}),
                     allow_task: None,
                     deny_task: Box::new(TooManyRequestsTask {}),
                 }),
@@ -359,6 +380,19 @@ mod tests {
 
         // on_grpc_response
         pipeline.digest(2, vec![1u8]);
+    }
+
+    #[test]
+    fn it_gets_attributes() {
+        let mut ctx = ReqRespCtx::default();
+        assert_eq!(
+            ctx.get_attribute("doesntexist"),
+            PendingValue::Resolved(None)
+        );
+        assert_eq!(
+            ctx.get_attribute("ratelimit.domain"),
+            PendingValue::Resolved(Some("example".to_string()))
+        );
     }
 }
 
