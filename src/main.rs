@@ -25,8 +25,8 @@ impl Pipeline {
         self.pending_actions
             .retain(|action| !action.apply(&mut self.ctx));
 
-        for todo in self.todos.drain(..) {
-            if let Some((token_id, t)) = todo.exec(&mut self.ctx) {
+        for task in self.todos.drain(..) {
+            if let Some((token_id, t)) = task.exec(&mut self.ctx) {
                 self.pending_tasks.insert(token_id, t);
             }
         }
@@ -55,7 +55,10 @@ impl Pipeline {
 
 impl Drop for Pipeline {
     fn drop(&mut self) {
-        if self.todos.is_empty().not() || self.pending_tasks.is_empty().not() {
+        if self.todos.is_empty().not()
+            || self.pending_tasks.is_empty().not()
+            || self.pending_actions.is_empty().not()
+        {
             panic!("Pipeline dropped with pending tasks");
         }
     }
