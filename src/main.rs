@@ -1,27 +1,13 @@
 use std::{collections::BTreeMap, ops::Not, rc::Rc};
 
-struct PendingTask {
-    is_blocking: bool,
-    ok_action: Option<AddResponseHeadersAction>,
-    rl_action: TooManyRequestsAction,
-    service: Rc<Service>,
-}
+struct Service {}
 
-impl PendingTask {
-    fn process_response(self, response: Vec<u8>) -> Option<Box<dyn Action>> {
-        if self.service.parse_message(response) {
-            Some(Box::new(self.rl_action))
-        } else {
-            if let Some(action) = self.ok_action {
-                Some(Box::new(action))
-            } else {
-                None
-            }
-        }
+impl Service {
+    pub(crate) fn dispatch(&self, ctx: &mut ReqRespCtx) -> usize {
+        0
     }
-
-    fn is_blocking(&self) -> bool {
-        self.is_blocking
+    fn parse_message(&self, mut message: Vec<u8>) -> bool {
+        Some(1u8) == message.pop()
     }
 }
 
@@ -92,14 +78,26 @@ impl RLTask {
     }
 }
 
-struct Service {}
+struct PendingTask {
+    is_blocking: bool,
+    ok_action: Option<AddResponseHeadersAction>,
+    rl_action: TooManyRequestsAction,
+    service: Rc<Service>,
+}
 
-impl Service {
-    pub(crate) fn dispatch(&self, ctx: &mut ReqRespCtx) -> usize {
-        0
+impl PendingTask {
+    fn process_response(self, response: Vec<u8>) -> Option<Box<dyn Action>> {
+        if self.service.parse_message(response) {
+            Some(Box::new(self.rl_action))
+        } else if let Some(action) = self.ok_action {
+            Some(Box::new(action))
+        } else {
+            None
+        }
     }
-    fn parse_message(&self, mut message: Vec<u8>) -> bool {
-        Some(1u8) == message.pop()
+
+    fn is_blocking(&self) -> bool {
+        self.is_blocking
     }
 }
 
@@ -133,6 +131,7 @@ impl Predicate {
     }
 }
 
+#[derive(Default)]
 struct ReqRespCtx {
     status_code: Option<u32>,
     response_headers: Vec<(String, String)>,
@@ -140,15 +139,6 @@ struct ReqRespCtx {
 
 impl ReqRespCtx {
     fn add_response_header(&mut self, key: &str, value: &str) {}
-}
-
-impl Default for ReqRespCtx {
-    fn default() -> Self {
-        Self {
-            status_code: None,
-            response_headers: Vec::new(),
-        }
-    }
 }
 
 #[cfg(test)]
