@@ -1,9 +1,11 @@
+use crate::Phase::ResponseHeaders;
+use std::cell::RefCell;
 use std::{collections::BTreeMap, ops::Not, rc::Rc};
 
 struct Service {}
 
 impl Service {
-    pub(crate) fn dispatch(&self, ctx: &mut ReqRespCtx) -> usize {
+    pub(crate) fn dispatch(&self, _ctx: &mut ReqRespCtx) -> usize {
         0
     }
     fn parse_message(&self, mut message: Vec<u8>) -> bool {
@@ -14,17 +16,21 @@ impl Service {
 struct Pipeline {
     ctx: ReqRespCtx,
     todos: Vec<RLTask>,
-    pendings: BTreeMap<usize, PendingTask>,
+    pending_tasks: BTreeMap<usize, PendingTask>,
+    pending_actions: Vec<Box<dyn Action>>,
 }
 
 impl Pipeline {
     fn eval(mut self) -> Option<Self> {
+        self.pending_actions
+            .retain(|action| !action.apply(&mut self.ctx));
+
         for todo in self.todos.drain(..) {
             if let Some((token_id, t)) = todo.exec(&mut self.ctx) {
-                self.pendings.insert(token_id, t);
+                self.pending_tasks.insert(token_id, t);
             }
         }
-        if self.pendings.is_empty() {
+        if self.pending_tasks.is_empty() && self.pending_actions.is_empty() {
             None
         } else {
             Some(self)
@@ -32,22 +38,24 @@ impl Pipeline {
     }
 
     fn digest(&mut self, token_id: usize, response: Vec<u8>) {
-        if let Some(pending) = self.pendings.remove(&token_id) {
+        if let Some(pending) = self.pending_tasks.remove(&token_id) {
             // Process the response
             if let Some(action) = pending.process_response(response) {
-                action.apply(&mut self.ctx);
+                if !action.apply(&mut self.ctx) {
+                    self.pending_actions.push(action);
+                }
             };
         }
     }
 
     fn is_blocked(&self) -> bool {
-        self.pendings.values().any(PendingTask::is_blocking)
+        self.pending_tasks.values().any(PendingTask::is_blocking)
     }
 }
 
 impl Drop for Pipeline {
     fn drop(&mut self) {
-        if self.todos.is_empty().not() || self.pendings.is_empty().not() {
+        if self.todos.is_empty().not() || self.pending_tasks.is_empty().not() {
             panic!("Pipeline dropped with pending tasks");
         }
     }
@@ -97,12 +105,13 @@ impl PendingTask {
     }
 
     fn is_blocking(&self) -> bool {
+        // This would need to peak into `ok_action` AND `rl_action` to see if we need to block
         self.is_blocking
     }
 }
 
 trait Action {
-    fn apply(&self, ctx: &mut ReqRespCtx);
+    fn apply(&self, ctx: &mut ReqRespCtx) -> bool;
 }
 
 struct AddResponseHeadersAction {
@@ -110,16 +119,22 @@ struct AddResponseHeadersAction {
 }
 
 impl Action for AddResponseHeadersAction {
-    fn apply(&self, ctx: &mut ReqRespCtx) {
-        ctx.response_headers = self.headers.clone();
+    fn apply(&self, ctx: &mut ReqRespCtx) -> bool {
+        if *ctx.test_current_phase.borrow() == Some(ResponseHeaders) {
+            ctx.response_headers = self.headers.clone();
+            true
+        } else {
+            false
+        }
     }
 }
 
 struct TooManyRequestsAction {}
 
 impl Action for TooManyRequestsAction {
-    fn apply(&self, ctx: &mut ReqRespCtx) {
+    fn apply(&self, ctx: &mut ReqRespCtx) -> bool {
         ctx.status_code = Some(429);
+        true
     }
 }
 
@@ -131,8 +146,17 @@ impl Predicate {
     }
 }
 
+#[derive(Eq, PartialEq)]
+enum Phase {
+    RequestHeaders,
+    RequestBoby,
+    ResponseHeaders,
+    ResponseBoby,
+}
+
 #[derive(Default)]
 struct ReqRespCtx {
+    test_current_phase: Rc<RefCell<Option<Phase>>>,
     status_code: Option<u32>,
     response_headers: Vec<(String, String)>,
 }
@@ -156,7 +180,8 @@ mod tests {
                 ok_action: None,
                 rl_action: TooManyRequestsAction {},
             }],
-            pendings: Default::default(),
+            pending_tasks: Default::default(),
+            pending_actions: Default::default(),
         };
 
         pipeline = pipeline
@@ -182,8 +207,11 @@ mod tests {
     #[test]
     fn it_not_rate_limits() {
         // on_request_headers() {
+        let mut ctx = ReqRespCtx::default();
+        let mut rc = Rc::new(RefCell::new(Some(Phase::RequestHeaders)));
+        ctx.test_current_phase = rc.clone();
         let mut pipeline = Pipeline {
-            ctx: Default::default(),
+            ctx: ctx,
             todos: vec![RLTask {
                 predicate: Predicate {},
                 service: Service {}.into(),
@@ -192,7 +220,8 @@ mod tests {
                 }),
                 rl_action: TooManyRequestsAction {},
             }],
-            pendings: Default::default(),
+            pending_tasks: Default::default(),
+            pending_actions: Default::default(),
         };
 
         pipeline = pipeline
@@ -219,6 +248,7 @@ mod tests {
         );
 
         // on_response_headers() {
+        rc.replace(Some(Phase::ResponseHeaders));
         assert!(pipeline.eval().is_none(), "Done now");
         // assert_eq!(
         //     pipeline.ctx.headers,
