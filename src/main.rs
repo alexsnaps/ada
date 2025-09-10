@@ -1,6 +1,12 @@
+use crate::PendingValue::Revolved;
 use crate::Phase::ResponseHeaders;
 use std::cell::RefCell;
 use std::{collections::BTreeMap, ops::Not, rc::Rc};
+
+enum Either<T, U> {
+    Left(T),
+    Right(U),
+}
 
 struct Service {}
 
@@ -25,12 +31,22 @@ impl Pipeline {
         self.pending_actions
             .retain(|action| !action.apply(&mut self.ctx));
 
+        let mut todos = Vec::default();
         for task in self.todos.drain(..) {
-            if let Some((token_id, t)) = task.exec(&mut self.ctx) {
-                self.pending_tasks.insert(token_id, t);
+            let either = task.exec(&mut self.ctx);
+            match either {
+                Either::Left(None) => {}
+                Either::Left(Some((token_id, t))) => {
+                    self.pending_tasks.insert(token_id, t);
+                }
+                Either::Right(todo) => {
+                    todos.push(todo);
+                }
             }
         }
-        if self.pending_tasks.is_empty() && self.pending_actions.is_empty() {
+        self.todos = todos;
+        if self.pending_tasks.is_empty() && self.pending_actions.is_empty() && self.todos.is_empty()
+        {
             None
         } else {
             Some(self)
@@ -72,20 +88,26 @@ struct RLTask {
 }
 
 impl RLTask {
-    fn exec(self, ctx: &mut ReqRespCtx) -> Option<(usize, PendingTask)> {
-        if self.predicate.eval() {
-            let token_id: usize = self.service.dispatch(ctx);
-            return Some((
-                token_id,
-                PendingTask {
-                    is_blocking: true,
-                    ok_action: self.ok_action,
-                    rl_action: self.rl_action,
-                    service: self.service,
-                },
-            ));
+    fn exec(self, ctx: &mut ReqRespCtx) -> Either<Option<(usize, PendingTask)>, Self> {
+        match self.predicate.eval() {
+            Revolved(exec) => {
+                if exec {
+                    let token_id: usize = self.service.dispatch(ctx);
+                    Either::Left(Some((
+                        token_id,
+                        PendingTask {
+                            is_blocking: true,
+                            ok_action: self.ok_action,
+                            rl_action: self.rl_action,
+                            service: self.service,
+                        },
+                    )))
+                } else {
+                    Either::Left(None)
+                }
+            }
+            PendingValue::Pending => Either::Right(self),
         }
-        None
     }
 }
 
@@ -141,11 +163,16 @@ impl Action for TooManyRequestsAction {
     }
 }
 
+enum PendingValue<T> {
+    Revolved(T),
+    Pending,
+}
+
 struct Predicate {}
 
 impl Predicate {
-    fn eval(&self) -> bool {
-        true
+    fn eval(&self) -> PendingValue<bool> {
+        Revolved(true)
     }
 }
 
