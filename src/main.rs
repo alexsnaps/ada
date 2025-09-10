@@ -3,11 +3,6 @@ use crate::Phase::ResponseHeaders;
 use std::cell::RefCell;
 use std::{collections::BTreeMap, rc::Rc};
 
-enum Either<T, U> {
-    Left(T),
-    Right(U),
-}
-
 struct Service {}
 
 impl Service {
@@ -21,7 +16,7 @@ impl Service {
 
 struct Pipeline {
     ctx: ReqRespCtx,
-    todos: Vec<Box<dyn Action>>,
+    todos: Vec<Box<dyn Task>>,
     pending_tasks: BTreeMap<usize, PendingTask>,
 }
 
@@ -30,14 +25,13 @@ impl Pipeline {
         let mut todos = Vec::default();
         for task in self.todos.drain(..) {
             match task.apply(&mut self.ctx) {
-                ActionOutcome::Done => {}
-                ActionOutcome::Deferred((token_id, t)) => {
-                    if self.pending_tasks.contains_key(&token_id) {
-                        panic!("NONONONONO")
+                TaskOutcome::Done => {}
+                TaskOutcome::Deferred((token_id, t)) => {
+                    if self.pending_tasks.insert(token_id, t).is_some() {
+                        panic!("Duplicate token_id={}", token_id);
                     }
-                    self.pending_tasks.insert(token_id, t);
                 }
-                ActionOutcome::Pending(action) => todos.push(action),
+                TaskOutcome::Pending(action) => todos.push(action),
             }
         }
         self.todos = todos;
@@ -53,9 +47,13 @@ impl Pipeline {
             // Process the response
             if let Some(action) = pending.process_response(response) {
                 match action.apply(&mut self.ctx) {
-                    ActionOutcome::Done => {}
-                    ActionOutcome::Deferred(_) => panic!("Action should not be deferred in digest"),
-                    ActionOutcome::Pending(action) => self.todos.push(action),
+                    TaskOutcome::Done => {}
+                    TaskOutcome::Deferred((token_id, pending_task)) => {
+                        if self.pending_tasks.insert(token_id, pending_task).is_some() {
+                            panic!("Duplicate token_id={}", token_id);
+                        }
+                    }
+                    TaskOutcome::Pending(action) => self.todos.push(action),
                 }
             };
         } else {
@@ -80,52 +78,47 @@ impl Drop for Pipeline {
 struct RLTask {
     predicate: Predicate,
     service: Rc<Service>,
-    ok_action: Option<AddResponseHeadersAction>,
-    rl_action: Box<dyn Action>,
+    allow_task: Option<Box<dyn Task>>,
+    deny_task: Box<dyn Task>,
 }
 
-impl Action for RLTask {
-    fn apply(self: Box<Self>, ctx: &mut ReqRespCtx) -> ActionOutcome {
+impl Task for RLTask {
+    fn apply(self: Box<Self>, ctx: &mut ReqRespCtx) -> TaskOutcome {
         match self.predicate.eval(ctx) {
             Resolved(exec) => {
                 if exec {
                     let token_id: usize = self.service.dispatch(ctx);
-                    ActionOutcome::Deferred((
+                    TaskOutcome::Deferred((
                         token_id,
                         PendingTask {
                             is_blocking: true,
-                            ok_action: self.ok_action,
-                            rl_action: self.rl_action,
+                            allow_task: self.allow_task,
+                            deny_task: self.deny_task,
                             service: self.service,
                         },
                     ))
                 } else {
-                    ActionOutcome::Done
+                    TaskOutcome::Done
                 }
             }
-            PendingValue::Pending => ActionOutcome::Pending(Box::new(RLTask {
-                predicate: self.predicate,
-                ok_action: self.ok_action,
-                rl_action: self.rl_action,
-                service: self.service,
-            })),
+            PendingValue::Pending => TaskOutcome::Pending(self),
         }
     }
 }
 
 struct PendingTask {
     is_blocking: bool,
-    ok_action: Option<AddResponseHeadersAction>,
-    rl_action: Box<dyn Action>,
+    allow_task: Option<Box<dyn Task>>,
+    deny_task: Box<dyn Task>,
     service: Rc<Service>,
 }
 
 impl PendingTask {
-    fn process_response(self, response: Vec<u8>) -> Option<Box<dyn Action>> {
+    fn process_response(self, response: Vec<u8>) -> Option<Box<dyn Task>> {
         if self.service.parse_message(response) {
-            Some(self.rl_action)
-        } else if let Some(action) = self.ok_action {
-            Some(Box::new(action))
+            Some(self.deny_task)
+        } else if let Some(action) = self.allow_task {
+            Some(action)
         } else {
             None
         }
@@ -137,40 +130,38 @@ impl PendingTask {
     }
 }
 
-enum ActionOutcome {
+enum TaskOutcome {
     Done,
     Deferred((usize, PendingTask)),
-    Pending(Box<dyn Action>),
+    Pending(Box<dyn Task>),
 }
 
-trait Action {
-    fn apply(self: Box<Self>, ctx: &mut ReqRespCtx) -> ActionOutcome;
+trait Task {
+    fn apply(self: Box<Self>, ctx: &mut ReqRespCtx) -> TaskOutcome;
 }
 
 #[derive(Clone)]
-struct AddResponseHeadersAction {
+struct AddResponseHeadersTask {
     headers: Vec<(String, String)>,
 }
 
-impl Action for AddResponseHeadersAction {
-    fn apply(self: Box<Self>, ctx: &mut ReqRespCtx) -> ActionOutcome {
+impl Task for AddResponseHeadersTask {
+    fn apply(self: Box<Self>, ctx: &mut ReqRespCtx) -> TaskOutcome {
         if *ctx.test_current_phase.borrow() == Some(ResponseHeaders) {
             ctx.response_headers = self.headers.clone();
-            ActionOutcome::Done
+            TaskOutcome::Done
         } else {
-            ActionOutcome::Pending(Box::new(AddResponseHeadersAction {
-                headers: self.headers,
-            }))
+            TaskOutcome::Pending(self)
         }
     }
 }
 
-struct TooManyRequestsAction {}
+struct TooManyRequestsTask {}
 
-impl Action for TooManyRequestsAction {
-    fn apply(self: Box<Self>, ctx: &mut ReqRespCtx) -> ActionOutcome {
+impl Task for TooManyRequestsTask {
+    fn apply(self: Box<Self>, ctx: &mut ReqRespCtx) -> TaskOutcome {
         ctx.status_code = Some(429);
-        ActionOutcome::Done
+        TaskOutcome::Done
     }
 }
 
@@ -228,8 +219,8 @@ mod tests {
             todos: vec![Box::new(RLTask {
                 predicate: Predicate {},
                 service: Service {}.into(),
-                ok_action: None,
-                rl_action: Box::new(TooManyRequestsAction {}),
+                allow_task: None,
+                deny_task: Box::new(TooManyRequestsTask {}),
             })],
             pending_tasks: Default::default(),
         };
@@ -266,10 +257,10 @@ mod tests {
             todos: vec![Box::new(RLTask {
                 predicate: Predicate {},
                 service: Service {}.into(),
-                ok_action: Some(AddResponseHeadersAction {
+                allow_task: Some(Box::new(AddResponseHeadersTask {
                     headers: vec![("X-RateLimit-Limit".to_string(), "10".to_string())],
-                }),
-                rl_action: Box::new(TooManyRequestsAction {}),
+                })),
+                deny_task: Box::new(TooManyRequestsTask {}),
             })],
             pending_tasks: Default::default(),
         };
@@ -328,14 +319,14 @@ mod tests {
                 Box::new(RLTask {
                     predicate: Predicate {},
                     service: Service {}.into(),
-                    ok_action: None,
-                    rl_action: Box::new(TooManyRequestsAction {}),
+                    allow_task: None,
+                    deny_task: Box::new(TooManyRequestsTask {}),
                 }),
                 Box::new(RLTask {
                     predicate: Predicate {},
                     service: Service {}.into(),
-                    ok_action: None,
-                    rl_action: Box::new(TooManyRequestsAction {}),
+                    allow_task: None,
+                    deny_task: Box::new(TooManyRequestsTask {}),
                 }),
             ],
             pending_tasks: Default::default(),
