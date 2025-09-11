@@ -41,19 +41,22 @@ struct Pipeline {
 
 impl Pipeline {
     fn eval(mut self) -> Option<Self> {
-        let mut todos = Vec::default();
-        for task in self.todos.drain(..) {
-            match task.apply(&mut self.ctx) {
-                TaskOutcome::Done => {}
+        self.todos = self
+            .todos
+            .drain(..)
+            .into_iter()
+            .filter_map(|todo| match todo.apply(&mut self.ctx) {
+                TaskOutcome::Done => None,
                 TaskOutcome::Deferred((token_id, t)) => {
                     if self.pending_tasks.insert(token_id, t).is_some() {
                         panic!("Duplicate token_id={}", token_id);
                     }
+                    None
                 }
-                TaskOutcome::Pending(action) => todos.push(action),
-            }
-        }
-        self.todos = todos;
+                TaskOutcome::Pending(action) => Some(action),
+            })
+            .collect();
+
         if self.pending_tasks.is_empty() && self.todos.is_empty() {
             None
         } else {
